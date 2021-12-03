@@ -251,8 +251,10 @@ static pose convertPoseIntoRelativeCoordinate(const pose &target_pose, const pos
     return trans_target_pose;
 }
 
+// param_callback回调函数的参数为NDT配置参数（autoware_config_msgs::ConfigNDT.msg）
 static void param_callback(const autoware_config_msgs::ConfigNDT::ConstPtr& input)
 {
+  // 函数判断_use_gnss与NDT配置参数init_pos_gnss是否相等
   if (_use_gnss != input->init_pos_gnss)
   {
     init_pos_set = 0;
@@ -270,7 +272,8 @@ static void param_callback(const autoware_config_msgs::ConfigNDT::ConstPtr& inpu
   if (input->resolution != ndt_res)
   {
     ndt_res = input->resolution;
-
+    // 按照方法类型的不同使用ndt.setResolution(ndt_res)函数
+    // 进行NDT网格大小的设置
     if (_method_type == MethodType::PCL_GENERIC)
       ndt.setResolution(ndt_res);
     else if (_method_type == MethodType::PCL_ANH)
@@ -303,6 +306,7 @@ static void param_callback(const autoware_config_msgs::ConfigNDT::ConstPtr& inpu
 #endif
   }
 
+  // 设置NDT算法收敛条件
   if (input->trans_epsilon != trans_eps)
   {
     trans_eps = input->trans_epsilon;
@@ -320,7 +324,7 @@ static void param_callback(const autoware_config_msgs::ConfigNDT::ConstPtr& inpu
       omp_ndt.setTransformationEpsilon(trans_eps);
 #endif
   }
-
+  // 设置最大迭代次数
   if (input->max_iterations != max_iter)
   {
     max_iter = input->max_iterations;
@@ -340,7 +344,9 @@ static void param_callback(const autoware_config_msgs::ConfigNDT::ConstPtr& inpu
   }
 
   if (_use_gnss == 0 && init_pos_set == 0)
-  {
+  { 
+    // 如果未使用gnss并且没有初始化车辆位姿
+    // 则利用NDT参数配置消息中的位姿进行初始化
     initial_pose.x = input->x;
     initial_pose.y = input->y;
     initial_pose.z = input->z;
@@ -350,6 +356,8 @@ static void param_callback(const autoware_config_msgs::ConfigNDT::ConstPtr& inpu
 
     if (_use_local_transform == true)
     {
+      // 如果使用局部变换，则在求初始位姿的时候需要补偿一个
+      // 局部变换矩阵local_transform.inverse()
       tf2::Vector3 v(input->x, input->y, input->z);
       tf2::Quaternion q;
       q.setRPY(input->roll, input->pitch, input->yaw);
@@ -411,20 +419,26 @@ static void param_callback(const autoware_config_msgs::ConfigNDT::ConstPtr& inpu
   }
 }
 
+// 该函数主要用于载入激光雷达数据作为初始全局地图map，并且将初始全局地图map作为NDT配准算法的目标点云
 static void map_callback(const sensor_msgs::PointCloud2::ConstPtr& input)
 {
+  // 如果points_map_num不等于输入点云的宽度时，更新点云参数
   // if (map_loaded == 0)
   if (points_map_num != input->width)
   {
     std::cout << "Update points_map." << std::endl;
-
+    
     points_map_num = input->width;
-
+    // 将输入激光点云数据的类型
+    // 从sensor_msgs::PointCloud2转换为pcl类型，保存至map
     // Convert the data type(from sensor_msgs to pcl).
     pcl::fromROSMsg(*input, map);
 
     if (_use_local_transform == true)
     {
+      // 如果局部变换存在，则向外广播局部变换
+      // 局部变换local_transform表示world坐标系
+      // 与map坐标系之间的变换
       tf2_ros::Buffer tf_buffer;
       tf2_ros::TransformListener tf_listener(tf_buffer);
       geometry_msgs::TransformStamped local_transform_msg;
@@ -436,24 +450,30 @@ static void map_callback(const sensor_msgs::PointCloud2::ConstPtr& input)
       {
         ROS_ERROR("%s", ex.what());
       }
-
+      // 将此刻的地图map坐标变换至world坐标系
       tf2::fromMsg(local_transform_msg, local_transform);
       pcl::transformPointCloud(map, map, tf2::transformToEigen(local_transform_msg).matrix().inverse().cast<float>());
     }
 
     pcl::PointCloud<pcl::PointXYZ>::Ptr map_ptr(new pcl::PointCloud<pcl::PointXYZ>(map));
 
+    // 根据方法类型的不同，来设置将要进行NDT配准的点云
     // Setting point cloud to be aligned to.
     if (_method_type == MethodType::PCL_GENERIC)
     {
       pcl::NormalDistributionsTransform<pcl::PointXYZ, pcl::PointXYZ> new_ndt;
       pcl::PointCloud<pcl::PointXYZ>::Ptr output_cloud(new pcl::PointCloud<pcl::PointXYZ>);
+      // 设置网格大小
       new_ndt.setResolution(ndt_res);
+      // 将map_ptr作为NDT的输入源点云
       new_ndt.setInputTarget(map_ptr);
+      // 设置最大迭代次数
       new_ndt.setMaximumIterations(max_iter);
+      // 设置步长大小
       new_ndt.setStepSize(step_size);
       new_ndt.setTransformationEpsilon(trans_eps);
-
+      // 利用单位矩阵作为初始坐标变换矩阵来进行NDT配准
+      // 此时第一针点云进行配准
       new_ndt.align(*output_cloud, Eigen::Matrix4f::Identity());
 
       pthread_mutex_lock(&mutex);
@@ -521,26 +541,36 @@ static void map_callback(const sensor_msgs::PointCloud2::ConstPtr& input)
       pthread_mutex_unlock(&mutex);
     }
 #endif
+    // 地图载入成功
     map_loaded = 1;
   }
 }
 
 static void gnss_callback(const geometry_msgs::PoseStamped::ConstPtr& input)
 {
+  // 将gnss的旋转矩阵参数的保存至tf类型的旋转四元数
   tf2::Quaternion gnss_q(input->pose.orientation.x, input->pose.orientation.y, input->pose.orientation.z,
                         input->pose.orientation.w);
+  // 将位置四元数转换为旋转矩阵gnss_m
   tf2::Matrix3x3 gnss_m(gnss_q);
-
+  // current_gnss_pose表示当前gnss的位置
   pose current_gnss_pose;
   current_gnss_pose.x = input->pose.position.x;
   current_gnss_pose.y = input->pose.position.y;
   current_gnss_pose.z = input->pose.position.z;
+  // 利用gnss_m.getRPY函数得到旋转矩阵的RPY旋转角
+  // 分别以三个参数进行输出
   gnss_m.getRPY(current_gnss_pose.roll, current_gnss_pose.pitch, current_gnss_pose.yaw);
 
   static pose previous_gnss_pose = current_gnss_pose;
+  // 记录当前接收到的gnss，并且初始位置设置为0
   ros::Time current_gnss_time = input->header.stamp;
   static ros::Time previous_gnss_time = current_gnss_time;
-
+  // 如果使用gnss，并且初始位置设置为0
+  // 或者fitness_score大于或等于500时
+  // 则进行gnss重定位，即将位置更新为当前的位姿
+  // 并计算当前位置与先前位置的偏差
+  // 注意,对于NDT配准的适应分数,应该越低越好,一般来说小于1
   if ((_use_gnss == 1 && init_pos_set == 0) || fitness_score >= _gnss_reinit_fitness)
   {
     previous_pose.x = previous_gnss_pose.x;
@@ -916,11 +946,15 @@ static void imu_callback(const sensor_msgs::Imu::Ptr& input)
   previous_imu_yaw = imu_yaw;
 }
 
+// 该回调函数主要进行多传感器之间的融合定位
 static void points_callback(const sensor_msgs::PointCloud2::ConstPtr& input)
 {
   health_checker_ptr_->CHECK_RATE("topic_rate_filtered_points_slow", 8, 5, 1, "topic filtered_points subscribe rate slow.");
+  // 默认地图载入为0，当载入地图
+  // 并且init_pos_set为1的时候，开始进行配准
   if (map_loaded == 1 && init_pos_set == 1)
   {
+    // 利用 std::chrono::system_clock::now 函数获取配准开始时间
     matching_start = std::chrono::system_clock::now();
 
     static tf2_ros::TransformBroadcaster br;
@@ -928,24 +962,34 @@ static void points_callback(const sensor_msgs::PointCloud2::ConstPtr& input)
     tf2::Quaternion predict_q, ndt_q, current_q, localizer_q;
 
     pcl::PointXYZ p;
+    
+    // 声明 pcl::PointCloud<pcl::PointXYZ> 类型的点云数据 filtered_scan 用来存储过滤后的点云
     pcl::PointCloud<pcl::PointXYZ> filtered_scan;
-
+    
+    // 获取当前接收点云的扫描时间
     ros::Time current_scan_time = input->header.stamp;
     static ros::Time previous_scan_time = current_scan_time;
 
+    // 将当前 sensor_msgs::PointCloud2 类型的输入点云数据
+    // 转化为 pcl::PointCloud<pcl::PointXYZ> 类型的点云数据filtered_scan
     pcl::fromROSMsg(*input, filtered_scan);
     pcl::PointCloud<pcl::PointXYZ>::Ptr filtered_scan_ptr(new pcl::PointCloud<pcl::PointXYZ>(filtered_scan));
+    
+    // 获取filtered_scan_ptr点云数量
     int scan_points_num = filtered_scan_ptr->size();
 
+    // 单位矩阵初始化车身底盘base_link与localizer
+    // 关于坐标源点的坐标变换矩阵
     Eigen::Matrix4f t(Eigen::Matrix4f::Identity());   // base_link
     Eigen::Matrix4f t2(Eigen::Matrix4f::Identity());  // localizer
 
+    // 声明 std::chrono::time_point<std::chrono::system_clock> 类型的配准起止时间以及getFitnessScore起止时间
     std::chrono::time_point<std::chrono::system_clock> align_start, align_end, getFitnessScore_start,
         getFitnessScore_end;
     static double align_time, getFitnessScore_time = 0.0;
 
     pthread_mutex_lock(&mutex);
-
+    // 按照不同的方法类型将filtered_scan_ptr作为NDT的输入点云
     if (_method_type == MethodType::PCL_GENERIC)
       ndt.setInputSource(filtered_scan_ptr);
     else if (_method_type == MethodType::PCL_ANH)
@@ -959,9 +1003,10 @@ static void points_callback(const sensor_msgs::PointCloud2::ConstPtr& input)
       omp_ndt.setInputSource(filtered_scan_ptr);
 #endif
 
+    // 计算前后两帧激光扫描的时间差
     // Guess the initial gross estimation of the transformation
     double diff_time = (current_scan_time - previous_scan_time).toSec();
-
+    // _offset为线性时，位置偏差和航向角等于速度x前后帧时间差
     if (_offset == "linear")
     {
       offset_x = current_velocity_x * diff_time;
@@ -969,6 +1014,8 @@ static void points_callback(const sensor_msgs::PointCloud2::ConstPtr& input)
       offset_z = current_velocity_z * diff_time;
       offset_yaw = angular_velocity * diff_time;
     }
+    // 如果_offset为二次类型，则利用vt+at^2表示offset_x
+    // offset_y,offset_z与offset_yaw,与线性保持一致
     else if (_offset == "quadratic")
     {
       offset_x = (current_velocity_x + current_accel_x * diff_time) * diff_time;
@@ -984,6 +1031,8 @@ static void points_callback(const sensor_msgs::PointCloud2::ConstPtr& input)
       offset_yaw = 0.0;
     }
 
+    // 估计位置的坐标xyz=前一帧位置xyz偏置位置的xyz
+    // 关于xy的轴角度与前一帧相等，航向角随着车辆转向发生变化
     predict_pose.x = previous_pose.x + offset_x;
     predict_pose.y = previous_pose.y + offset_y;
     predict_pose.z = previous_pose.z + offset_z;
@@ -991,6 +1040,8 @@ static void points_callback(const sensor_msgs::PointCloud2::ConstPtr& input)
     predict_pose.pitch = previous_pose.pitch;
     predict_pose.yaw = previous_pose.yaw + offset_yaw;
 
+    // 根据imu和odom的使用情况，采用不同的方法对NDT配准的
+    // 关于xy的轴角度与前一帧相等，航向角随着车辆转向发生变化
     if (_use_imu == true && _use_odom == true)
       imu_odom_calc(current_scan_time);
     if (_use_imu == true && _use_odom == false)
@@ -1007,24 +1058,31 @@ static void points_callback(const sensor_msgs::PointCloud2::ConstPtr& input)
       predict_pose_for_ndt = predict_pose_odom;
     else
       predict_pose_for_ndt = predict_pose;
-
+    // 将predict_pose_for_ndt位置的xyz坐标作为init_translation初始平移的构造函数参数
     Eigen::Translation3f init_translation(predict_pose_for_ndt.x, predict_pose_for_ndt.y, predict_pose_for_ndt.z);
     Eigen::AngleAxisf init_rotation_x(predict_pose_for_ndt.roll, Eigen::Vector3f::UnitX());
     Eigen::AngleAxisf init_rotation_y(predict_pose_for_ndt.pitch, Eigen::Vector3f::UnitY());
     Eigen::AngleAxisf init_rotation_z(predict_pose_for_ndt.yaw, Eigen::Vector3f::UnitZ());
+    // init_guess表示的是激光雷达坐标系
+    // 相对于全局地图坐标系的坐标变换矩阵
     Eigen::Matrix4f init_guess = (init_translation * init_rotation_z * init_rotation_y * init_rotation_x) * tf_btol;
 
     pcl::PointCloud<pcl::PointXYZ>::Ptr output_cloud(new pcl::PointCloud<pcl::PointXYZ>);
-
+    // 根据不同方法类型开始进行NDT配准，这点与ndt_mapping一致
     if (_method_type == MethodType::PCL_GENERIC)
     {
+      // 获取此时时间戳作为配准开始时间
       align_start = std::chrono::system_clock::now();
+      // 利用初始变换矩阵init_gness进行NDT配准
+      // 将配准结果保存至output_cloud
       ndt.align(*output_cloud, init_guess);
+      // 获取配准结束时间
       align_end = std::chrono::system_clock::now();
-
+      // 是否已经收敛
       has_converged = ndt.hasConverged();
-
+      // 获取NDT配准的最终变换矩阵
       t = ndt.getFinalTransformation();
+      // 得到迭代次数
       iteration = ndt.getFinalNumIteration();
 
       getFitnessScore_start = std::chrono::system_clock::now();
@@ -1088,8 +1146,9 @@ static void points_callback(const sensor_msgs::PointCloud2::ConstPtr& input)
       trans_probability = omp_ndt.getTransformationProbability();
     }
 #endif
+    // 计算配准时间
     align_time = std::chrono::duration_cast<std::chrono::microseconds>(align_end - align_start).count() / 1000.0;
-
+    // 计算此时车身底盘相对于全局地图坐标系的最终变换矩阵
     t2 = t * tf_btol.inverse();
 
     getFitnessScore_time =
@@ -1097,34 +1156,39 @@ static void points_callback(const sensor_msgs::PointCloud2::ConstPtr& input)
         1000.0;
 
     pthread_mutex_unlock(&mutex);
-
+    // localizer的旋转矩阵
     tf2::Matrix3x3 mat_l;  // localizer
+    // 将NDT最终变换的旋转矩阵赋予mat_l
     mat_l.setValue(static_cast<double>(t(0, 0)), static_cast<double>(t(0, 1)), static_cast<double>(t(0, 2)),
                    static_cast<double>(t(1, 0)), static_cast<double>(t(1, 1)), static_cast<double>(t(1, 2)),
                    static_cast<double>(t(2, 0)), static_cast<double>(t(2, 1)), static_cast<double>(t(2, 2)));
 
+    // 更新localizer_pose的位置向量
     // Update localizer_pose
     localizer_pose.x = t(0, 3);
     localizer_pose.y = t(1, 3);
     localizer_pose.z = t(2, 3);
+    // 最终变换的旋转rpy角度值赋予 localizer_pose 的 rpy 角度值
     mat_l.getRPY(localizer_pose.roll, localizer_pose.pitch, localizer_pose.yaw, 1);
-
+    // 相对于base_link的旋转矩阵mat_b由t2变换矩阵进行赋值
     tf2::Matrix3x3 mat_b;  // base_link
     mat_b.setValue(static_cast<double>(t2(0, 0)), static_cast<double>(t2(0, 1)), static_cast<double>(t2(0, 2)),
                    static_cast<double>(t2(1, 0)), static_cast<double>(t2(1, 1)), static_cast<double>(t2(1, 2)),
                    static_cast<double>(t2(2, 0)), static_cast<double>(t2(2, 1)), static_cast<double>(t2(2, 2)));
-
+    
+    // ndt_pose的坐标由车身底盘相对于map的平移向量来赋值
+    // 计算车辆在全局地图坐标系下的位置
     // Update ndt_pose
     ndt_pose.x = t2(0, 3);
     ndt_pose.y = t2(1, 3);
     ndt_pose.z = t2(2, 3);
     mat_b.getRPY(ndt_pose.roll, ndt_pose.pitch, ndt_pose.yaw, 1);
-
+    // 计算ndt_pose和predict_pose之间的误差
     // Calculate the difference between ndt_pose and predict_pose
     predict_pose_error = sqrt((ndt_pose.x - predict_pose_for_ndt.x) * (ndt_pose.x - predict_pose_for_ndt.x) +
                               (ndt_pose.y - predict_pose_for_ndt.y) * (ndt_pose.y - predict_pose_for_ndt.y) +
                               (ndt_pose.z - predict_pose_for_ndt.z) * (ndt_pose.z - predict_pose_for_ndt.z));
-
+    // 如果误差不大于阈值，则不使用预测的位置，否则使用预测的位置
     if (predict_pose_error <= PREDICT_POSE_THRESHOLD)
     {
       use_predict_pose = 0;
@@ -1134,7 +1198,7 @@ static void points_callback(const sensor_msgs::PointCloud2::ConstPtr& input)
       use_predict_pose = 1;
     }
     use_predict_pose = 0;
-
+    // 如果不使用预测位置，则将NDT配准得到的位置估计作为当前的位置
     if (use_predict_pose == 0)
     {
       current_pose.x = ndt_pose.x;
@@ -1146,6 +1210,7 @@ static void points_callback(const sensor_msgs::PointCloud2::ConstPtr& input)
     }
     else
     {
+      //否则使用imu，odom等估计的位置作为现在的位置
       current_pose.x = predict_pose_for_ndt.x;
       current_pose.y = predict_pose_for_ndt.y;
       current_pose.z = predict_pose_for_ndt.z;
@@ -1352,9 +1417,11 @@ static void points_callback(const sensor_msgs::PointCloud2::ConstPtr& input)
 
     predict_pose_pub.publish(predict_pose_msg);
     health_checker_ptr_->CHECK_RATE("topic_rate_ndt_pose_slow", 8, 5, 1, "topic ndt_pose publish rate slow.");
+    // 发布车辆当前预测位姿
     ndt_pose_pub.publish(ndt_pose_msg);
+    // 发布激光雷达当前预测位姿
     localizer_pose_pub.publish(localizer_pose_msg);
-
+    // 发布"/base_link"到"/map"的坐标变换
     // Send TF "base_link" to "map"
     transform.setOrigin(tf2::Vector3(current_pose.x, current_pose.y, current_pose.z));
     transform.setRotation(current_q);
@@ -1366,8 +1433,9 @@ static void points_callback(const sensor_msgs::PointCloud2::ConstPtr& input)
     geometry_msgs::TransformStamped tf_msg = tf2::toMsg(tf);
     tf_msg.child_frame_id = _output_tf_frame_id;
     br.sendTransform(tf_msg);
-
+    // 记录匹配结束的时间
     matching_end = std::chrono::system_clock::now();
+    // 记录匹配进行的耗时，并存入time_ndt_matching.data然后通过发布者time_ndt_matching_pub进行发布
     exe_time = std::chrono::duration_cast<std::chrono::microseconds>(matching_end - matching_start).count() / 1000.0;
     time_ndt_matching.data = exe_time;
     health_checker_ptr_->CHECK_MAX_VALUE("time_ndt_matching", time_ndt_matching.data, 50, 70, 100, "value time_ndt_matching is too high.");
@@ -1392,7 +1460,9 @@ static void points_callback(const sensor_msgs::PointCloud2::ConstPtr& input)
     health_checker_ptr_->CHECK_MAX_VALUE("estimate_twist_angular", angular_velocity, 5, 10, 15, "value linear angular twist is too high.");
     estimated_vel_pub.publish(estimate_vel_msg);
 
+    // 发布配准时间的消息
     // Set values for /ndt_stat
+    // 设置NDT状态消息ndt_stat并发
     ndt_stat_msg.header.stamp = current_scan_time;
     ndt_stat_msg.exe_time = time_ndt_matching.data;
     ndt_stat_msg.iteration = iteration;
@@ -1451,7 +1521,8 @@ static void points_callback(const sensor_msgs::PointCloud2::ConstPtr& input)
     std::cout << "Align time: " << align_time << std::endl;
     std::cout << "Get fitness score time: " << getFitnessScore_time << std::endl;
     std::cout << "-----------------------------------------------------------------" << std::endl;
-
+    
+    // 相邻两帧之间的位姿偏差offset归零
     offset_imu_x = 0.0;
     offset_imu_y = 0.0;
     offset_imu_z = 0.0;
@@ -1472,7 +1543,8 @@ static void points_callback(const sensor_msgs::PointCloud2::ConstPtr& input)
     offset_imu_odom_roll = 0.0;
     offset_imu_odom_pitch = 0.0;
     offset_imu_odom_yaw = 0.0;
-
+    
+    // 更新当前位姿为上一帧位姿
     // Update previous_***
     previous_pose.x = current_pose.x;
     previous_pose.y = current_pose.y;
@@ -1481,8 +1553,9 @@ static void points_callback(const sensor_msgs::PointCloud2::ConstPtr& input)
     previous_pose.pitch = current_pose.pitch;
     previous_pose.yaw = current_pose.yaw;
 
+    // 更新当前扫描时间为上一帧扫描时间
     previous_scan_time = current_scan_time;
-
+    // 更新速度
     previous_previous_velocity = previous_velocity;
     previous_velocity = current_velocity;
     previous_velocity_x = current_velocity_x;
@@ -1494,8 +1567,10 @@ static void points_callback(const sensor_msgs::PointCloud2::ConstPtr& input)
   }
 }
 
+// 开启一个线程检测并更新地图
 void* thread_func(void* args)
 {
+  // 开启一个线程检测并更新地图
   ros::NodeHandle nh_map;
   ros::CallbackQueue map_callback_queue;
   nh_map.setCallbackQueue(&map_callback_queue);
